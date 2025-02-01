@@ -16,4 +16,10 @@ pull off additional sensor readings to aid in competition.
     b. ESP32 controls an external transister that switches the PWM signals. (more reliable / predictable failure mode)
 
 ## Env Setup Steps
-Following guides from (esp-rs.org)[https://docs.esp-rs.org/book].
+Following guides from [esp-rs.org](https://docs.esp-rs.org/book). Using `no_std` for a bare-metal application.
+
+## Build / Run Commands
+
+* `make build`: Builds the project
+* `make run`: Deploy binary to ESP32 board
+* `make sim`: Deploy binary to Wokwi simulation
