@@ -10,6 +10,12 @@
             "attrs": {
                 "flashSize": "16"
             }
+        },
+        {
+            "type": "wokwi-mpu6050",
+            "id": "imu",
+            "top": 0.3,
+            "left":0.3 
         }
     ],
     "connections": [
@@ -24,7 +30,11 @@
             "$serialMonitor:TX",
             "",
             []
-        ]
+        ],
+        ["esp:3V3.1", "imu:VCC", "red", []],
+        ["esp:3V3.1", "imu:GND.1", "black", []],
+        ["esp:2", "imu:SCL", "white", []],
+        ["esp:3", "imu:SDA", "white", []],
     ],
     "serialMonitor": {
         "display": "terminal",
