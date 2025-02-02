@@ -4,10 +4,12 @@
 use bbqueue::BBBuffer;
 use core::cell::RefCell;
 use critical_section::Mutex;
+use esp32_robot_management_unit::{PinEvent, PwmInput, PwmOutput};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::interrupt::InterruptConfigurable;
+use esp_hal::time::Instant;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::{AnyTimer, Timer};
@@ -24,7 +26,37 @@ static GLOBAL_TIMER: Mutex<RefCell<Option<AnyTimer>>> = Mutex::new(RefCell::new(
 static LEFT_DRIVE_INPUT: Mutex<RefCell<Option<Input>>> = Mutex::new(RefCell::new(None));
 static RIGHT_DRIVE_INPUT: Mutex<RefCell<Option<Input>>> = Mutex::new(RefCell::new(None));
 
-static BB: BBBuffer<6> = BBBuffer::new();
+const PWM_QUEUE_SIZE: usize = PinEvent::PIN_EVENT_SIZE * 10;
+static LEFT_PWM_QUEUE: BBBuffer<PWM_QUEUE_SIZE> = BBBuffer::new();
+static LEFT_PWM_INPUT_QUEUE: Mutex<RefCell<Option<PwmInput<'static, PWM_QUEUE_SIZE>>>> =
+    Mutex::new(RefCell::new(None));
+
+static RIGHT_PWM_QUEUE: BBBuffer<PWM_QUEUE_SIZE> = BBBuffer::new();
+static RIGHT_PWM_INPUT_QUEUE: Mutex<RefCell<Option<PwmInput<'static, PWM_QUEUE_SIZE>>>> =
+    Mutex::new(RefCell::new(None));
+
+fn register_pwm_input_queues() -> (
+    PwmOutput<'static, PWM_QUEUE_SIZE>,
+    PwmOutput<'static, PWM_QUEUE_SIZE>,
+) {
+    // split the bbqueues into producer & consumers
+    // SAFETY: unwrap ok here as panic is the only valid response to calling this regisration twice
+    // unit / bench tests should catch any obvious mistake.
+    let (left_prod, left_cons) = LEFT_PWM_QUEUE.try_split().unwrap();
+    let (right_prod, right_cons) = RIGHT_PWM_QUEUE.try_split().unwrap();
+
+    // register the producer side of the queue up into static variables visable to the ISR
+    critical_section::with(|cs| {
+        LEFT_PWM_INPUT_QUEUE
+            .borrow_ref_mut(cs)
+            .replace(PwmInput::new(left_prod));
+        RIGHT_PWM_INPUT_QUEUE
+            .borrow_ref_mut(cs)
+            .replace(PwmInput::new(right_prod));
+    });
+
+    return (PwmOutput::new(left_cons), PwmOutput::new(right_cons));
+}
 
 #[main]
 fn main() -> ! {
@@ -47,8 +79,6 @@ fn main() -> ! {
 
     let mut gpio_io = Io::new(peripherals.IO_MUX);
 
-    let (mut prod, mut cons) = BB.try_split().unwrap();
-
     // Initalize the PWM Input subsystem
     let sys_clock = SystemTimer::new(peripherals.SYSTIMER);
     let mut gpio9 = Input::new(peripherals.GPIO9, Pull::None);
@@ -66,66 +96,94 @@ fn main() -> ! {
         RIGHT_DRIVE_INPUT.borrow_ref_mut(cs).replace(gpio8);
     });
 
+    let (mut left_pwm_events, mut right_pwm_events) = register_pwm_input_queues();
+
     // bind the interrupt handler so GPIO interrupts are captured
     gpio_io.set_interrupt_handler(gpio_handler);
 
     let delay = Delay::new();
     loop {
-        info!("Hello world!");
-        delay.delay_millis(500);
+        match left_pwm_events.pop() {
+            Ok(event) => info!("Left Input: {}", event),
+            Err(_) => (),
+        };
+        match right_pwm_events.pop() {
+            Ok(event) => info!("Right Input: {}", event),
+            Err(_) => (),
+        };
+        // info!("Hello world!");
+        delay.delay_millis(1);
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/v0.23.1/examples/src/bin
 }
 
-enum PinEvent {
-    RisingEdge(Instant<u64, 1, 1000000>),
-    FallingEdge(Instant<u64, 1, 1000000>),
-}
-
-fn read_pin_event(pin: &Input, timestamp: &Instant<u64, 1, 1000000>) -> Option<PinEvent> {
+#[inline]
+fn read_pin_event(pin: &Input, timestamp: &Instant) -> Option<PinEvent> {
     let level = match pin.is_interrupt_set() {
         false => return None,
         true => pin.level(),
     };
     return match level {
-        Level::Low => Some(PinEvent::FallingEdge(timestamp)),
-        Level::High => Some(PinEvent::RisingEdge(timestamp)),
+        Level::Low => Some(PinEvent::FallingEdge(timestamp.clone())),
+        Level::High => Some(PinEvent::RisingEdge(timestamp.clone())),
     };
+}
+
+#[inline]
+fn irq_queue_gpio_event<const N: usize>(
+    queue: &mut PwmInput<'_, N>,
+    pin: &mut Input<'_>,
+    timestamp: &Instant,
+) {
+    // read the pin's event and clear interrupts if applicable
+    let event = match read_pin_event(pin, timestamp) {
+        None => return (),
+        Some(event) => {
+            pin.clear_interrupt();
+            event
+        }
+    };
+
+    // attempt to push to the queue three times before throwing out the event.
+    // TODO: test on real hardware to make sure this is a practical & safe upper limit
+    for _ in 0..3 {
+        match queue.push(event.clone()) {
+            Ok(_) => return (),
+            Err(_) => (),
+        };
+    }
 }
 
 #[handler]
 fn gpio_handler() {
-    let mut left_input: Option<PinEvent> = None;
-    let mut right_input: Option<PinEvent> = None;
-
     // save off the left & right pin inputs within the critical section
     // this section should also take care to reset the interrupt of any set pins
     critical_section::with(|cs| {
-        let timestamp = GLOBAL_TIMER.borrow_ref_mut(cs).as_mut().unwrap().now();
-
-        left_input = match LEFT_DRIVE_INPUT.borrow_ref_mut(cs).as_mut() {
-            Some(pin) => match read_pin_event(pin, timestamp) {
-                None => None,
-                Some(event) => {
-                    pin.clear_interrupt();
-                    Some(event)
-                }
-            },
-            None => None,
+        // SAFETY: timer is globally registered before interrupt is active
+        // but a 0 interval is used if something's been set up wrong instead of panicing in an ISR
+        let timestamp = match GLOBAL_TIMER.borrow_ref_mut(cs).as_mut() {
+            Some(timer) => timer.now(),
+            None => Instant::from_ticks(0u64),
         };
-        right_input = match RIGHT_DRIVE_INPUT.borrow_ref_mut(cs).as_mut() {
-            Some(pin) => match read_pin_event(pin, timestamp) {
-                None => None,
-                Some(event) => {
-                    pin.clear_interrupt();
-                    Some(event)
-                }
-            },
-            None => None,
+        match (
+            LEFT_DRIVE_INPUT.borrow_ref_mut(cs).as_mut(),
+            LEFT_PWM_INPUT_QUEUE.borrow_ref_mut(cs).as_mut(),
+        ) {
+            (Some(pin), Some(queue)) => irq_queue_gpio_event(queue, pin, &timestamp),
+            (Some(pin), None) => pin.clear_interrupt(), // make sure we don't latch interupts
+            _ => (),
         };
+        match (
+            RIGHT_DRIVE_INPUT.borrow_ref_mut(cs).as_mut(),
+            RIGHT_PWM_INPUT_QUEUE.borrow_ref_mut(cs).as_mut(),
+        ) {
+            (Some(pin), Some(queue)) => irq_queue_gpio_event(queue, pin, &timestamp),
+            (Some(pin), None) => pin.clear_interrupt(), // make sure we don't latch interupts
+            _ => (),
+        };
+        // TODO fix up the sharing / ownership model of the queues so the push doesn't happen in a
+        // critical section. The queues do not need locks but the lazy loading mechanism
+        // 'technically' does.
     });
-    // TODO: store left & right PWM event into a queue with the timestamp for the main loop to
-    // pop and convert to calculate the pulse width / duty cycle.
-    // Both pins need to be read because the handler is triggered for either pin.
 }
