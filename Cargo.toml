@@ -46,6 +46,8 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
+# thread safe queue/circular buffer for ISR and DMA
+bbqueue = { git = "https://github.com/ancantus/bbqueue.git", branch = "critical-section-atomics", features = [ "no_atomics" ]}
 
 [profile.dev]
 # Rust debug is too slow.

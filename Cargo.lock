@@ -24,6 +24,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbqueue"
+version = "0.5.1"
+source = "git+https://github.com/ancantus/bbqueue.git?branch=critical-section-atomics#4c1e567e1a436db5b3f7ebf874334dec1fdd5935"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
 name = "bitfield"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +565,7 @@ dependencies = [
 name = "esp32-robot-management-unit"
 version = "0.1.0"
 dependencies = [
+ "bbqueue",
  "bleps",
  "critical-section",
  "embedded-io",
